@@ -1,0 +1,31 @@
+# Copy to wrangler.toml and fill in your own values:
+#   cp wrangler.toml.example wrangler.toml
+name = "emby-rules-portal"
+main = "src/index.js"
+compatibility_date = "2026-11-10"
+workers_dev = false
+
+# Your domain + route. The Worker takes over this hostname.
+routes = [{ pattern = "rules.example.com/*", zone_name = "example.com" }]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "emby-rules-portal"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+# IPv6 plugin auto-sync every 5 minutes (Worker cron).
+# NOTE: Cloudflare Free plan allows 5 cron triggers per account. If yours are
+# already full, leave this block out and use scripts/sync-ipv6-d1.py instead
+# (e.g. a systemd timer on your own server, every 5 minutes).
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+# Public base URL of this portal, no trailing slash. Subscription links are
+# built from it, so it must match the route above.
+PUBLIC_BASE_URL = "https://rules.example.com"
+# Default IPv6 host domain for newly created users (their Emby domain).
+# Leave empty if you don't use the IPv6 fixed-Host plugin.
+DEFAULT_IPV6_HOST_DOMAIN = "emby.example.com"
+# Login session lifetime in days.
+SESSION_TTL_DAYS = "30"
