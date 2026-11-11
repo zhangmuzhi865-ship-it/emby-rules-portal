@@ -4,6 +4,14 @@
  */
 
 const TOKEN_RE = /^[0-9a-f]{64}$/;
+
+// Login brute-force protection (D1-backed, per-IP + per-account).
+// 5 failures in 15 min from one IP, or 10 failures in 15 min for one
+// account, locks that key for 15 min (429). A successful login clears both.
+const RL_WINDOW_SEC = 900;
+const RL_IP_MAX = 5;
+const RL_USER_MAX = 10;
+const RL_LOCK_SEC = 900;
 const RULE_PREFIXES = ["DOMAIN-SUFFIX,", "IP-CIDR,", "IP-CIDR6,"];
 const FORMAT_SPECS = [
   ["loon", "emby-direct.list", "Loon", "Loon 远程规则 · 策略 DIRECT"],
@@ -167,15 +175,59 @@ async function getSessionUser(request, env) {
   if (row) row._sid = sid;
   return row || null;
 }
+function clientIp(request) {
+  return (request.headers.get("CF-Connecting-IP") || "").trim() || "unknown";
+}
+async function rlGet(env, key) {
+  const row = await env.DB.prepare("SELECT failures, last_attempt, locked_until FROM login_attempts WHERE key=?").bind(key).first();
+  return row || { failures: 0, last_attempt: 0, locked_until: 0 };
+}
+// Returns remaining lock minutes (0 = not locked).
+async function rlCheck(env, keys) {
+  const now = Math.floor(Date.now() / 1000);
+  for (const key of keys) {
+    const r = await rlGet(env, key);
+    if (r.locked_until > now) return Math.ceil((r.locked_until - now) / 60);
+  }
+  return 0;
+}
+// Records one failure for each key; returns true if any key just got locked.
+async function rlFail(env, keys) {
+  const now = Math.floor(Date.now() / 1000);
+  let locked = false;
+  for (const key of keys) {
+    const max = key.startsWith("ip:") ? RL_IP_MAX : RL_USER_MAX;
+    const r = await rlGet(env, key);
+    let failures = (now - r.last_attempt > RL_WINDOW_SEC) ? 1 : r.failures + 1;
+    let lockedUntil = r.locked_until > now ? r.locked_until : 0;
+    if (failures >= max) { lockedUntil = now + RL_LOCK_SEC; failures = 0; locked = true; }
+    await env.DB.prepare(
+      "INSERT INTO login_attempts(key, failures, last_attempt, locked_until) VALUES(?,?,?,?) " +
+      "ON CONFLICT(key) DO UPDATE SET failures=excluded.failures, last_attempt=excluded.last_attempt, locked_until=excluded.locked_until"
+    ).bind(key, failures, now, lockedUntil).run();
+  }
+  return locked;
+}
+async function rlClear(env, keys) {
+  for (const key of keys) {
+    await env.DB.prepare("DELETE FROM login_attempts WHERE key=?").bind(key).run();
+  }
+}
 async function handleLogin(request, env) {
   const fd = await request.formData();
   const username = String(fd.get("username") || "").trim().toLowerCase(); // usernames are case-insensitive (iOS autocapitalizes first letter)
   const password = String(fd.get("password") || "");
   if (!username || !password) return htmlResp(400, loginPage("请输入用户名和密码"));
+  const keys = [`ip:${clientIp(request)}`, `user:${username}`];
+  const lockedMin = await rlCheck(env, keys);
+  if (lockedMin > 0) return htmlResp(429, loginPage(`登录尝试次数过多，请 ${lockedMin} 分钟后再试`));
   const user = await getUserByUsername(env, username);
-  if (!user || !user.password_hash) return htmlResp(401, loginPage("用户名或密码错误"));
-  const ok = await verifyPassword(password, user.password_hash);
-  if (!ok) return htmlResp(401, loginPage("用户名或密码错误"));
+  const ok = user && user.password_hash ? await verifyPassword(password, user.password_hash) : false;
+  if (!ok) {
+    const locked = await rlFail(env, keys);
+    return htmlResp(locked ? 429 : 401, loginPage(locked ? "登录尝试次数过多，请 15 分钟后再试" : "用户名或密码错误"));
+  }
+  await rlClear(env, keys);
   const sid = randHex(32);
   const ttlDays = parseInt(env.SESSION_TTL_DAYS || "30", 10);
   const exp = Math.floor(Date.now() / 1000) + ttlDays * 86400;
