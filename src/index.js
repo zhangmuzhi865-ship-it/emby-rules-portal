@@ -12,7 +12,8 @@ const RL_WINDOW_SEC = 900;
 const RL_IP_MAX = 5;
 const RL_USER_MAX = 10;
 const RL_LOCK_SEC = 900;
-const RULE_PREFIXES = ["DOMAIN-SUFFIX,", "IP-CIDR,", "IP-CIDR6,"];
+const RULE_PREFIXES = ["DOMAIN-SUFFIX,", "DOMAIN,", "DOMAIN-KEYWORD,", "IP-CIDR,", "IP-CIDR6,"];
+const MATCH_TYPES = ["DOMAIN-SUFFIX", "DOMAIN", "DOMAIN-KEYWORD"];
 const FORMAT_SPECS = [
   ["loon", "emby-direct.list", "Loon", "Loon 远程规则 · 策略 DIRECT"],
   ["surge", "emby-direct-surge.list", "Surge", "Surge 远程规则集 · DIRECT"],
@@ -68,6 +69,11 @@ async function handleRequest(request, env) {
     if (!user) return jsonResp(401, { error: "未登录" });
     return handleAdd(request, env, user);
   }
+  if (path === "/app/api/change-type" && request.method === "POST") {
+    const user = await getSessionUser(request, env);
+    if (!user) return jsonResp(401, { error: "未登录" });
+    return handleChangeType(request, env, user);
+  }
   if (path === "/app/api/bulk-add" && request.method === "POST") {
     const user = await getSessionUser(request, env);
     if (!user) return jsonResp(401, { error: "未登录" });
@@ -115,6 +121,7 @@ async function handleRequest(request, env) {
     if (rest === "/" && request.method === "GET") return htmlResp(200, adminPage(user));
     if (rest === "/api/rules" && request.method === "GET") return jsonResp(200, await currentPayload(env, user));
     if (rest === "/api/add" && request.method === "POST") return handleAdd(request, env, user);
+    if (rest === "/api/change-type" && request.method === "POST") return handleChangeType(request, env, user);
     if (rest === "/api/bulk-add" && request.method === "POST") return handleBulkAdd(request, env, user);
     if (rest === "/api/delete" && request.method === "POST") return handleDelete(request, env, user);
     return textResp(404, "not found\n");
@@ -312,7 +319,7 @@ async function handleCreateUser(request, env, user) {
     const existing = await getUserByUsername(env, username);
     if (existing) return jsonResp(400, { error: "用户名已存在" });
     const hash = await hashPassword(password);
-    await env.DB.prepare("INSERT INTO users(username,password_hash,role,admin_token,sub_token,ipv6_host_domain,rules_text,plugin_text) VALUES(?,?,?,?,?,?,?,NULL)").bind(username, hash, role, randHex(32), randHex(32), (env.DEFAULT_IPV6_HOST_DOMAIN || ""), "").run();
+    await env.DB.prepare("INSERT INTO users(username,password_hash,role,admin_token,sub_token,ipv6_host_domain,rules_text,plugin_text) VALUES(?,?,?,?,?,?,'',NULL)").bind(username, hash, role, randHex(32), randHex(32), env.DEFAULT_IPV6_HOST_DOMAIN || "").run();
     return jsonResp(200, { ok: true, username, role });
   } catch (e) { return errResp(e); }
 }
@@ -372,10 +379,32 @@ function hexToBuf(hex) { const a = new Uint8Array(hex.length/2); for(let i=0;i<a
 function ruleLines(text) {
   return (text || "").split("\n").map(l => l.trim()).filter(l => RULE_PREFIXES.some(p => l.startsWith(p)));
 }
-function normalizeInput(raw) {
+function normalizeInput(raw, type = "DOMAIN-SUFFIX") {
+  if (!MATCH_TYPES.includes(type)) type = "DOMAIN-SUFFIX";
   let value = (raw || "").trim();
   if (!value) throw bad("请输入 Emby 链接或域名");
   if (value.length > 2048) throw bad("输入过长");
+  // DOMAIN-KEYWORD: a bare word is the keyword itself; a URL contributes its host.
+  if (type === "DOMAIN-KEYWORD") {
+    const md = value.match(/https?:\/\/[^\s)>\]]+/i);
+    let keyword = "";
+    if (md) {
+      try { keyword = new URL(md[0]).hostname.replace(/^\[|\]$/g, ""); } catch { throw bad("链接格式不正确"); }
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(keyword)) {
+        const parts = keyword.split(".").map(Number);
+        if (parts.some(p => p < 0 || p > 255)) throw bad("IP 格式不正确");
+        return `IP-CIDR,${keyword}/32`;
+      }
+      if (keyword.includes(":")) return `IP-CIDR6,${keyword.toLowerCase()}/128`;
+      if (["abc","example.com","example.net","example.org"].includes(keyword.toLowerCase())) throw bad("检测到示例占位符，未添加");
+    } else {
+      keyword = value.replace(/^[\s\t\r\n[\]()<>,;]+|[\s\t\r\n[\]()<>,;]+$/g, "");
+    }
+    keyword = keyword.toLowerCase().replace(/\.$/, "");
+    if (!keyword) throw bad("没有识别到关键词");
+    if (keyword.length > 253 || !/^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(keyword)) throw bad("关键词格式不正确");
+    return `DOMAIN-KEYWORD,${keyword}`;
+  }
   const md = value.match(/https?:\/\/[^\s)>\]]+/i);
   if (md) value = md[0];
   value = value.replace(/^[\s\t\r\n[\]()<>,;]+|[\s\t\r\n[\]()<>,;]+$/g, "");
@@ -384,7 +413,7 @@ function normalizeInput(raw) {
   try { host = new URL(candidate).hostname; } catch { throw bad("链接格式不正确"); }
   if (!host) throw bad("没有识别到域名或 IP");
   host = host.replace(/^\[|\]$/g, "");
-  // IPv4/IPv6?
+  // IPv4/IPv6? (match type does not apply to IPs)
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
     const parts = host.split(".").map(Number);
     if (parts.some(p => p < 0 || p > 255)) throw bad("IP 格式不正确");
@@ -402,7 +431,7 @@ function normalizeInput(raw) {
   if (domain.length > 253 || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(domain)) {
     throw bad("域名格式不正确");
   }
-  return `DOMAIN-SUFFIX,${domain}`;
+  return `${type},${domain}`;
 }
 function addRule(text, rule) {
   const lines = (text || "").replace(/\n$/, "").split("\n");
@@ -423,7 +452,7 @@ function deleteRule(text, rule) {
 async function handleAdd(request, env, user) {
   try {
     const fd = await request.formData();
-    const rule = normalizeInput(String(fd.get("url") || ""));
+    const rule = normalizeInput(String(fd.get("url") || ""), String(fd.get("type") || "DOMAIN-SUFFIX"));
     const fresh = await getUserById(env, user.id);
     const res = addRule(fresh.rules_text || "", rule);
     if (res.created) await saveRules(env, user.id, res.text);
@@ -433,7 +462,8 @@ async function handleAdd(request, env, user) {
 // ---------- Bulk paste: parse a whole line notice (numbered items, notes,
 // URLs) into rules, reusing normalizeInput's validation. Labels come from
 // the numbered item headers and are only used in the result report.
-function parseBulkPaste(text) {
+function parseBulkPaste(text, type = "DOMAIN-SUFFIX") {
+  if (!MATCH_TYPES.includes(type)) type = "DOMAIN-SUFFIX";
   const candidates = [];
   const skipped = [];
   const seen = new Set();
@@ -454,10 +484,23 @@ function parseBulkPaste(text) {
   if (!blocks.length) blocks.push({ label: "", text: lines });
   for (const block of blocks) {
     const blockText = block.text.join("\n");
+    const explicitValues = new Set();
+    // Lines that already carry a type (e.g. pasted back from a ruleset) keep it.
+    for (const line of block.text) {
+      const em = line.match(/^\s*(DOMAIN-SUFFIX|DOMAIN|DOMAIN-KEYWORD),([^\s,;]+)\s*$/);
+      if (!em) continue;
+      explicitValues.add(em[2].toLowerCase());
+      try {
+        const rule = normalizeInput(em[2], em[1]);
+        if (!seen.has(rule)) { seen.add(rule); candidates.push({ rule, label: block.label, value: line.trim() }); }
+      } catch (e) {
+        skipped.push({ value: line.trim(), reason: e.message || "无法识别" });
+      }
+    }
     for (const raw of blockText.match(urlRe) || []) {
       const value = raw.replace(/[.,;。！!？?、]+$/, "");
       try {
-        const rule = normalizeInput(value);
+        const rule = normalizeInput(value, type);
         if (!seen.has(rule)) { seen.add(rule); candidates.push({ rule, label: block.label, value }); }
       } catch (e) {
         skipped.push({ value, reason: e.message || "无法识别" });
@@ -467,9 +510,10 @@ function parseBulkPaste(text) {
     for (const tok of withoutUrls.split(/[\s,;，；、()（）\[\]{}<>""'']+/)) {
       const v = tok.trim().replace(/^[.\-]+|[.\-]+$/g, "");
       if (!v || !v.includes(".") || !/[a-zA-Z]/.test(v)) continue;
+      if (explicitValues.has(v.toLowerCase())) continue;
       if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/.test(v)) continue;
       try {
-        const rule = normalizeInput(v);
+        const rule = normalizeInput(v, type);
         if (!seen.has(rule)) { seen.add(rule); candidates.push({ rule, label: block.label, value: v }); }
       } catch (_e) { /* bare-domain false positives are ignored silently */ }
     }
@@ -483,7 +527,7 @@ async function handleBulkAdd(request, env, user) {
     const text = String(fd.get("text") || "");
     if (!text.trim()) return jsonResp(400, { error: "请粘贴线路内容" });
     if (text.length > 100000) return jsonResp(400, { error: "粘贴内容过长（最多 10 万字）" });
-    const parsed = parseBulkPaste(text);
+    const parsed = parseBulkPaste(text, String(fd.get("type") || "DOMAIN-SUFFIX"));
     const capped = parsed.candidates.length > 200;
     const list = capped ? parsed.candidates.slice(0, 200) : parsed.candidates;
     const fresh = await getUserById(env, user.id);
@@ -502,6 +546,31 @@ async function handleBulkAdd(request, env, user) {
     if (parsed.skipped.length) parts.push(parsed.skipped.length + " 条跳过");
     if (capped) parts.push("超过 200 条上限，仅处理前 200 条");
     return jsonResp(200, { added, existed, skipped: parsed.skipped, message: parts.join("，") });
+  } catch (e) { return errResp(e); }
+}
+
+async function handleChangeType(request, env, user) {
+  try {
+    const fd = await request.formData();
+    const oldRule = String(fd.get("rule") || "");
+    const to = String(fd.get("type") || "");
+    if (!MATCH_TYPES.includes(to)) return jsonResp(400, { error: "匹配类型无效" });
+    const idx = oldRule.indexOf(",");
+    if (idx < 0) return jsonResp(400, { error: "规则格式无效" });
+    const kind = oldRule.slice(0, idx);
+    const value = oldRule.slice(idx + 1).trim();
+    if (kind === "IP-CIDR" || kind === "IP-CIDR6") return jsonResp(400, { error: "IP 规则不能改匹配类型" });
+    if (!MATCH_TYPES.includes(kind)) return jsonResp(400, { error: "这条规则不能改匹配类型" });
+    if (kind === to) return jsonResp(200, { rule: oldRule, changed: false });
+    const fresh = await getUserById(env, user.id);
+    const rules = new Set(ruleLines(fresh.rules_text || ""));
+    if (!rules.has(oldRule)) return jsonResp(404, { error: "规则不存在，可能已被删除" });
+    const newRule = normalizeInput(value, to);
+    if (rules.has(newRule)) return jsonResp(400, { error: "目标类型已存在：" + newRule });
+    const lines = (fresh.rules_text || "").replace(/\n$/, "").split("\n");
+    const updated = lines.map(l => l.trim() === oldRule ? newRule : l);
+    await saveRules(env, user.id, updated.join("\n") + "\n");
+    return jsonResp(200, { rule: newRule, old: oldRule, changed: true });
   } catch (e) { return errResp(e); }
 }
 
@@ -528,6 +597,7 @@ function convertRule(rule, target) {
   }
   if (target === "qx") {
     if (kind === "DOMAIN-SUFFIX") return `host-suffix, ${rest}, direct`;
+    if (kind === "DOMAIN-KEYWORD") return `host-keyword, ${rest}, direct`;
     if (kind === "IP-CIDR") return `ip-cidr, ${rest}, direct, no-resolve`;
     if (kind === "IP-CIDR6") return `ip6-cidr, ${rest}, direct, no-resolve`;
     return `host, ${rest}, direct`;
@@ -585,7 +655,7 @@ function serveSgmodule(user) {
 
 async function currentPayload(env, user) {
   const rules = ruleLines(user.rules_text || "");
-  const base = (env.PUBLIC_BASE_URL || "https://rules.example.com").replace(/\/$/, ""); // set PUBLIC_BASE_URL in wrangler.toml [vars]
+  const base = (env.PUBLIC_BASE_URL || "https://rules.example.com").replace(/\/$/, "");
   const subs = Object.fromEntries(FORMAT_SPECS.map(([slug, filename]) => [slug, `${base}/rules-sub/${user.sub_token}/${filename}`]));
   return {
     count: rules.length,
@@ -700,7 +770,7 @@ main{max-width:760px;margin:0 auto;padding:22px 14px 40px}.card{background:var(-
 h1{font-size:24px;margin:0 0 4px}h2{font-size:18px;margin:0 0 12px}.muted{color:var(--muted);font-size:14px}
 .row{display:flex;gap:8px;align-items:center}.row input{flex:1;min-width:0}label{display:block;font-size:14px;color:var(--muted);margin:10px 0 4px}
 input,select{width:100%;border:1px solid #cbd3e1;border-radius:12px;padding:13px 12px;font-size:16px;background:#fff}textarea{width:100%;border:1px solid #cbd3e1;border-radius:12px;padding:13px 12px;font-size:15px;background:#fff;resize:vertical;font-family:inherit}
-button{border:0;border-radius:12px;background:var(--blue);color:#fff;font-size:16px;padding:13px 16px;white-space:nowrap;cursor:pointer}button.secondary{background:#eef3ff;color:#1d4ed8}button.delete{background:#fff0ef;color:var(--red);border:1px solid #f3bbb6;padding:8px 10px;font-size:14px}
+button{border:0;border-radius:12px;background:var(--blue);color:#fff;font-size:16px;padding:13px 16px;white-space:nowrap;cursor:pointer}button.secondary{background:#eef3ff;color:#1d4ed8}button.delete{background:#fff0ef;color:var(--red);border:1px solid #f3bbb6;padding:8px 10px;font-size:14px}.type-btn{background:#eef3ff;color:#1d4ed8;border:1px solid #c7d6fb;padding:8px 10px;font-size:14px}
 .status{min-height:24px;margin-top:10px;font-size:14px}.ok{color:var(--green)}.err{color:var(--red)}.sub{display:block;word-break:break-all;background:#f1f4f9;border-radius:10px;padding:10px;font-size:13px;margin:8px 0}
 ul{list-style:none;padding:0;margin:0;max-height:52vh;overflow:auto;border-top:1px solid var(--line)}li.rule{display:flex;gap:10px;align-items:center;padding:9px 2px;border-bottom:1px solid var(--line)}.rule-text{flex:1;min-width:0;font:13px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
 .undo{display:flex;gap:8px;align-items:center;margin-top:12px;padding:10px;border-radius:12px;background:#effaf2;color:#166534;font-size:14px}.undo[hidden]{display:none}.undo button{margin-left:auto;padding:8px 12px;font-size:14px}
@@ -713,14 +783,14 @@ ul{list-style:none;padding:0;margin:0;max-height:52vh;overflow:auto;border-top:1
   <section class="card" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start"><div><h1>${esc(title)}</h1>${whoLine}</div>${logout}</section>
   <section class="card">
     <h2>添加新线路</h2>
-    <form id="add-form"><div class="row"><input id="url" name="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴 https://example.com:12307/emby"><button type="submit">添加直连</button></div></form>
+    <form id="add-form"><div class="row"><input id="url" name="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴 https://example.com:12307/emby"><select id="match-type" name="type" style="flex:0 0 auto;width:auto"><option value="DOMAIN-SUFFIX" selected>后缀匹配</option><option value="DOMAIN">精确匹配</option><option value="DOMAIN-KEYWORD">包含匹配</option></select><button type="submit">添加直连</button></div></form>
     <div id="status" class="status"></div><div class="muted">端口和路径会自动去除；示例占位符不会添加。</div>
   </section>
   <section class="card">
     <h2>批量粘贴线路</h2>
     <form id="bulk-form">
       <textarea id="bulk-text" rows="7" placeholder="把整段线路通知粘贴到这里，比如：&#10;1. CF线路1号&#10;   https://line1.example.com:443&#10;2. CF线路2号&#10;   https://line2.example.com:443"></textarea>
-      <div style="margin-top:10px"><button type="submit">识别并全部添加</button></div>
+      <div class="row" style="margin-top:10px"><select id="bulk-type" name="type" style="flex:0 0 auto;width:auto"><option value="DOMAIN-SUFFIX" selected>默认：后缀匹配</option><option value="DOMAIN">精确匹配</option><option value="DOMAIN-KEYWORD">包含匹配</option></select><button type="submit">识别并全部添加</button></div>
     </form>
     <div id="bulk-status" class="status"></div>
     <div id="bulk-result"></div>
@@ -774,19 +844,21 @@ const API=${JSON.stringify(apiBase)};
 const form=document.getElementById("add-form"),input=document.getElementById("url"),statusBox=document.getElementById("status"),formatsBox=document.getElementById("formats"),rulesBox=document.getElementById("rules"),countBox=document.getElementById("count"),undoBox=document.getElementById("undo"),undoText=document.getElementById("undo-text"),undoButton=document.getElementById("undo-button");
 let lastDeleted="",undoTimer;
 function showStatus(text,good){statusBox.textContent=text;statusBox.className=good?"status ok":"status err"}
-function addValueFor(rule){if(rule.startsWith("DOMAIN-SUFFIX,"))return rule.slice(14);if(rule.startsWith("IP-CIDR6,"))return rule.slice(9).replace(/\\/128$/,"");if(rule.startsWith("IP-CIDR,"))return rule.slice(8).replace(/\\/32$/,"");return ""}
+function addValueFor(rule){const i=rule.indexOf(",");if(i<0)return "";let v=rule.slice(i+1);if(rule.startsWith("IP-CIDR6,"))v=v.replace(/\\/128$/,"");if(rule.startsWith("IP-CIDR,"))v=v.replace(/\\/32$/,"");return v}
 function hideUndo(){lastDeleted="";undoBox.hidden=true;if(undoTimer)clearTimeout(undoTimer)}
 function offerUndo(rule){lastDeleted=rule;undoText.textContent="已删除此规则，可在 15 秒内撤销";undoBox.hidden=false;if(undoTimer)clearTimeout(undoTimer);undoTimer=setTimeout(hideUndo,15000)}
 async function copyText(text){try{await navigator.clipboard.writeText(text);return true}catch(_){return false}}
 function renderFormats(formats){formatsBox.innerHTML="";for(const fmt of (formats||[])){const wrap=document.createElement("div");wrap.className="fmt";const head=document.createElement("div");head.className="fmt-head";const info=document.createElement("div");const name=document.createElement("div");name.className="fmt-name";name.textContent=fmt.label;const hint=document.createElement("div");hint.className="fmt-hint";hint.textContent=fmt.hint;info.append(name,hint);const btn=document.createElement("button");btn.type="button";btn.className="secondary";btn.textContent="复制";btn.addEventListener("click",async()=>{const ok=await copyText(fmt.url);showStatus(ok?fmt.label+" 地址已复制":"请长按地址手动复制",ok)});head.append(info,btn);const url=document.createElement("span");url.className="sub";url.textContent=fmt.url;wrap.append(head,url);formatsBox.appendChild(wrap)}}
-async function refresh(){const response=await fetch(API+"/rules",{cache:"no-store"});const data=await response.json();if(!response.ok){if(response.status===401){location.href="/login";return}throw new Error(data.error||"读取失败")}renderFormats(data.formats||[]);countBox.textContent="("+data.count+" 条)";rulesBox.innerHTML="";for(const rule of data.rules){const item=document.createElement("li");item.className="rule";const text=document.createElement("span");text.className="rule-text";text.textContent=rule;const del=document.createElement("button");del.type="button";del.className="delete";del.textContent="删除";del.addEventListener("click",()=>removeRule(rule));item.append(text,del);rulesBox.appendChild(item)}}
+async function refresh(){const response=await fetch(API+"/rules",{cache:"no-store"});const data=await response.json();if(!response.ok){if(response.status===401){location.href="/login";return}throw new Error(data.error||"读取失败")}renderFormats(data.formats||[]);countBox.textContent="("+data.count+" 条)";rulesBox.innerHTML="";for(const rule of data.rules){const item=document.createElement("li");item.className="rule";const text=document.createElement("span");text.className="rule-text";text.textContent=rule;item.append(text);const kind=rule.slice(0,rule.indexOf(","));if(kind==="DOMAIN-SUFFIX"||kind==="DOMAIN"||kind==="DOMAIN-KEYWORD"){const tb=document.createElement("button");tb.type="button";tb.className="type-btn";tb.textContent=kind==="DOMAIN-SUFFIX"?"后缀":kind==="DOMAIN"?"精确":"包含";tb.title="点击切换匹配类型";tb.addEventListener("click",()=>changeType(rule));item.append(tb)}const del=document.createElement("button");del.type="button";del.className="delete";del.textContent="删除";del.addEventListener("click",()=>removeRule(rule));item.append(del);rulesBox.appendChild(item)}}
+const TYPE_CYCLE={"DOMAIN-SUFFIX":"DOMAIN","DOMAIN":"DOMAIN-KEYWORD","DOMAIN-KEYWORD":"DOMAIN-SUFFIX"};
+async function changeType(rule){const kind=rule.slice(0,rule.indexOf(","));const next=TYPE_CYCLE[kind];if(!next)return;showStatus("正在切换匹配类型…",true);const response=await fetch(API+"/change-type",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"rule="+encodeURIComponent(rule)+"&type="+encodeURIComponent(next)});const data=await response.json().catch(()=>({}));if(!response.ok){showStatus(data.error||"更改失败",false);return}showStatus("已更改："+data.rule,true);await refresh()}
 async function removeRule(rule){if(!confirm("确认删除这条直连规则？\\n\\n"+rule))return;showStatus("正在删除…",true);const response=await fetch(API+"/delete",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"rule="+encodeURIComponent(rule)});const data=await response.json();if(!response.ok){showStatus(data.error||"删除失败",false);return}showStatus("已删除："+data.rule,true);offerUndo(data.rule);await refresh()}
-form.addEventListener("submit",async event=>{event.preventDefault();const value=input.value.trim();if(!value)return;showStatus("正在添加…",true);const response=await fetch(API+"/add",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"url="+encodeURIComponent(value)});const data=await response.json();if(!response.ok){showStatus(data.error||"添加失败",false);return}input.value="";hideUndo();showStatus(data.created?"已添加："+data.rule:"规则已存在："+data.rule,true);await refresh()});
-undoButton.addEventListener("click",async()=>{if(!lastDeleted)return;const rule=lastDeleted,value=addValueFor(rule);if(!value){showStatus("撤销失败，请重新添加",false);hideUndo();return}const response=await fetch(API+"/add",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"url="+encodeURIComponent(value)});const data=await response.json();if(!response.ok){showStatus(data.error||"撤销失败",false);return}hideUndo();showStatus("已恢复："+data.rule,true);await refresh()});
+form.addEventListener("submit",async event=>{event.preventDefault();const value=input.value.trim();if(!value)return;showStatus("正在添加…",true);const response=await fetch(API+"/add",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"url="+encodeURIComponent(value)+"&type="+encodeURIComponent(document.getElementById("match-type").value)});const data=await response.json();if(!response.ok){showStatus(data.error||"添加失败",false);return}input.value="";hideUndo();showStatus(data.created?"已添加："+data.rule:"规则已存在："+data.rule,true);await refresh()});
+undoButton.addEventListener("click",async()=>{if(!lastDeleted)return;const rule=lastDeleted,value=addValueFor(rule),kind=rule.slice(0,rule.indexOf(","));if(!value){showStatus("撤销失败，请重新添加",false);hideUndo();return}const response=await fetch(API+"/add",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"url="+encodeURIComponent(value)+"&type="+encodeURIComponent(kind)});const data=await response.json();if(!response.ok){showStatus(data.error||"撤销失败",false);return}hideUndo();showStatus("已恢复："+data.rule,true);await refresh()});
 const bulkForm=document.getElementById("bulk-form"),bulkText=document.getElementById("bulk-text"),bulkStatus=document.getElementById("bulk-status"),bulkResult=document.getElementById("bulk-result");
 function showBulkStatus(text,good){if(!bulkStatus)return;bulkStatus.textContent=text;bulkStatus.className=good?"status ok":"status err"}
 function bulkLine(text){const d=document.createElement("div");d.style.cssText="font-size:13px;padding:3px 0;word-break:break-all";d.textContent=text;return d}
-if(bulkForm){bulkForm.addEventListener("submit",async event=>{event.preventDefault();const value=bulkText.value.trim();if(!value)return;showBulkStatus("正在识别…",true);if(bulkResult)bulkResult.innerHTML="";const fd=new FormData();fd.append("text",value);const response=await fetch(API+"/bulk-add",{method:"POST",body:fd});const data=await response.json().catch(()=>({}));if(!response.ok){showBulkStatus(data.error||"批量添加失败",false);return}showBulkStatus(data.message||"已处理",true);if(bulkResult){for(const a of (data.added||[]))bulkResult.appendChild(bulkLine("＋ "+(a.label?a.label+" → ":"")+a.rule));for(const e of (data.existed||[]))bulkResult.appendChild(bulkLine("＝ 已存在："+e.rule));for(const s of (data.skipped||[]))bulkResult.appendChild(bulkLine("－ 跳过 "+s.value+"（"+s.reason+"）"))}bulkText.value="";await refresh()})}
+if(bulkForm){bulkForm.addEventListener("submit",async event=>{event.preventDefault();const value=bulkText.value.trim();if(!value)return;showBulkStatus("正在识别…",true);if(bulkResult)bulkResult.innerHTML="";const fd=new FormData();fd.append("text",value);fd.append("type",document.getElementById("bulk-type").value);const response=await fetch(API+"/bulk-add",{method:"POST",body:fd});const data=await response.json().catch(()=>({}));if(!response.ok){showBulkStatus(data.error||"批量添加失败",false);return}showBulkStatus(data.message||"已处理",true);if(bulkResult){for(const a of (data.added||[]))bulkResult.appendChild(bulkLine("＋ "+(a.label?a.label+" → ":"")+a.rule));for(const e of (data.existed||[]))bulkResult.appendChild(bulkLine("＝ 已存在："+e.rule));for(const s of (data.skipped||[]))bulkResult.appendChild(bulkLine("－ 跳过 "+s.value+"（"+s.reason+"）"))}bulkText.value="";await refresh()})}
 const pwForm=document.getElementById("pw-form"),pwStatus=document.getElementById("pw-status");
 function showPwStatus(text,good){if(!pwStatus)return;pwStatus.textContent=text;pwStatus.className=good?"status ok":"status err"}
 if(pwForm){pwForm.addEventListener("submit",async event=>{event.preventDefault();showPwStatus("正在更新密码…",true);const fd=new FormData(pwForm);const response=await fetch(API+"/change-password",{method:"POST",body:fd});const data=await response.json().catch(()=>({}));if(!response.ok){showPwStatus(data.error||"修改失败",false);return}pwForm.reset();showPwStatus(data.message||"密码已更新",true)})}
