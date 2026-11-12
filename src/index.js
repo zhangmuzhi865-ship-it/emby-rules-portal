@@ -68,6 +68,11 @@ async function handleRequest(request, env) {
     if (!user) return jsonResp(401, { error: "未登录" });
     return handleAdd(request, env, user);
   }
+  if (path === "/app/api/bulk-add" && request.method === "POST") {
+    const user = await getSessionUser(request, env);
+    if (!user) return jsonResp(401, { error: "未登录" });
+    return handleBulkAdd(request, env, user);
+  }
   if (path === "/app/api/delete" && request.method === "POST") {
     const user = await getSessionUser(request, env);
     if (!user) return jsonResp(401, { error: "未登录" });
@@ -110,6 +115,7 @@ async function handleRequest(request, env) {
     if (rest === "/" && request.method === "GET") return htmlResp(200, adminPage(user));
     if (rest === "/api/rules" && request.method === "GET") return jsonResp(200, await currentPayload(env, user));
     if (rest === "/api/add" && request.method === "POST") return handleAdd(request, env, user);
+    if (rest === "/api/bulk-add" && request.method === "POST") return handleBulkAdd(request, env, user);
     if (rest === "/api/delete" && request.method === "POST") return handleDelete(request, env, user);
     return textResp(404, "not found\n");
   }
@@ -424,6 +430,81 @@ async function handleAdd(request, env, user) {
     return jsonResp(200, { created: res.created, rule });
   } catch (e) { return errResp(e); }
 }
+// ---------- Bulk paste: parse a whole line notice (numbered items, notes,
+// URLs) into rules, reusing normalizeInput's validation. Labels come from
+// the numbered item headers and are only used in the result report.
+function parseBulkPaste(text) {
+  const candidates = [];
+  const skipped = [];
+  const seen = new Set();
+  const urlRe = /https?:\/\/[^\s)>\]'",;。？！]+/gi;
+  const lines = text.split(/\r?\n/);
+  const blocks = [];
+  let cur = { label: "", text: [] };
+  for (const line of lines) {
+    const m = line.match(/^\s*\d{1,3}[.、．]\s*(.*)$/);
+    if (m) {
+      if (cur.text.length || cur.label) blocks.push(cur);
+      cur = { label: m[1].trim().slice(0, 60), text: [] };
+    } else {
+      cur.text.push(line);
+    }
+  }
+  if (cur.text.length || cur.label) blocks.push(cur);
+  if (!blocks.length) blocks.push({ label: "", text: lines });
+  for (const block of blocks) {
+    const blockText = block.text.join("\n");
+    for (const raw of blockText.match(urlRe) || []) {
+      const value = raw.replace(/[.,;。！!？?、]+$/, "");
+      try {
+        const rule = normalizeInput(value);
+        if (!seen.has(rule)) { seen.add(rule); candidates.push({ rule, label: block.label, value }); }
+      } catch (e) {
+        skipped.push({ value, reason: e.message || "无法识别" });
+      }
+    }
+    const withoutUrls = blockText.replace(urlRe, " ");
+    for (const tok of withoutUrls.split(/[\s,;，；、()（）\[\]{}<>""'']+/)) {
+      const v = tok.trim().replace(/^[.\-]+|[.\-]+$/g, "");
+      if (!v || !v.includes(".") || !/[a-zA-Z]/.test(v)) continue;
+      if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/.test(v)) continue;
+      try {
+        const rule = normalizeInput(v);
+        if (!seen.has(rule)) { seen.add(rule); candidates.push({ rule, label: block.label, value: v }); }
+      } catch (_e) { /* bare-domain false positives are ignored silently */ }
+    }
+  }
+  return { candidates, skipped };
+}
+
+async function handleBulkAdd(request, env, user) {
+  try {
+    const fd = await request.formData();
+    const text = String(fd.get("text") || "");
+    if (!text.trim()) return jsonResp(400, { error: "请粘贴线路内容" });
+    if (text.length > 100000) return jsonResp(400, { error: "粘贴内容过长（最多 10 万字）" });
+    const parsed = parseBulkPaste(text);
+    const capped = parsed.candidates.length > 200;
+    const list = capped ? parsed.candidates.slice(0, 200) : parsed.candidates;
+    const fresh = await getUserById(env, user.id);
+    const existing = new Set(ruleLines(fresh.rules_text || ""));
+    const added = [], existed = [];
+    let rulesText = fresh.rules_text || "";
+    for (const c of list) {
+      if (existing.has(c.rule)) { existed.push(c); continue; }
+      const res = addRule(rulesText, c.rule);
+      if (res.created) { rulesText = res.text; existing.add(c.rule); added.push(c); }
+      else existed.push(c);
+    }
+    if (added.length) await saveRules(env, user.id, rulesText);
+    const parts = ["已添加 " + added.length + " 条"];
+    if (existed.length) parts.push(existed.length + " 条已存在");
+    if (parsed.skipped.length) parts.push(parsed.skipped.length + " 条跳过");
+    if (capped) parts.push("超过 200 条上限，仅处理前 200 条");
+    return jsonResp(200, { added, existed, skipped: parsed.skipped, message: parts.join("，") });
+  } catch (e) { return errResp(e); }
+}
+
 async function handleDelete(request, env, user) {
   try {
     const fd = await request.formData();
@@ -618,7 +699,7 @@ function portalHtml({ title, apiBase, showLogout, who, isOwner }) {
 main{max-width:760px;margin:0 auto;padding:22px 14px 40px}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 5px 18px rgba(16,24,40,.04)}
 h1{font-size:24px;margin:0 0 4px}h2{font-size:18px;margin:0 0 12px}.muted{color:var(--muted);font-size:14px}
 .row{display:flex;gap:8px;align-items:center}.row input{flex:1;min-width:0}label{display:block;font-size:14px;color:var(--muted);margin:10px 0 4px}
-input,select{width:100%;border:1px solid #cbd3e1;border-radius:12px;padding:13px 12px;font-size:16px;background:#fff}
+input,select{width:100%;border:1px solid #cbd3e1;border-radius:12px;padding:13px 12px;font-size:16px;background:#fff}textarea{width:100%;border:1px solid #cbd3e1;border-radius:12px;padding:13px 12px;font-size:15px;background:#fff;resize:vertical;font-family:inherit}
 button{border:0;border-radius:12px;background:var(--blue);color:#fff;font-size:16px;padding:13px 16px;white-space:nowrap;cursor:pointer}button.secondary{background:#eef3ff;color:#1d4ed8}button.delete{background:#fff0ef;color:var(--red);border:1px solid #f3bbb6;padding:8px 10px;font-size:14px}
 .status{min-height:24px;margin-top:10px;font-size:14px}.ok{color:var(--green)}.err{color:var(--red)}.sub{display:block;word-break:break-all;background:#f1f4f9;border-radius:10px;padding:10px;font-size:13px;margin:8px 0}
 ul{list-style:none;padding:0;margin:0;max-height:52vh;overflow:auto;border-top:1px solid var(--line)}li.rule{display:flex;gap:10px;align-items:center;padding:9px 2px;border-bottom:1px solid var(--line)}.rule-text{flex:1;min-width:0;font:13px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
@@ -634,6 +715,16 @@ ul{list-style:none;padding:0;margin:0;max-height:52vh;overflow:auto;border-top:1
     <h2>添加新线路</h2>
     <form id="add-form"><div class="row"><input id="url" name="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴 https://example.com:12307/emby"><button type="submit">添加直连</button></div></form>
     <div id="status" class="status"></div><div class="muted">端口和路径会自动去除；示例占位符不会添加。</div>
+  </section>
+  <section class="card">
+    <h2>批量粘贴线路</h2>
+    <form id="bulk-form">
+      <textarea id="bulk-text" rows="7" placeholder="把整段线路通知粘贴到这里，比如：&#10;1. CF线路1号&#10;   https://line1.example.com:443&#10;2. CF线路2号&#10;   https://line2.example.com:443"></textarea>
+      <div style="margin-top:10px"><button type="submit">识别并全部添加</button></div>
+    </form>
+    <div id="bulk-status" class="status"></div>
+    <div id="bulk-result"></div>
+    <div class="muted">自动识别里面的全部链接和域名，去重后一次性加入规则集；示例占位符和格式不对的会跳过并告诉你。</div>
   </section>
   <section class="card">
     <h2>订阅地址</h2>
@@ -692,6 +783,10 @@ async function refresh(){const response=await fetch(API+"/rules",{cache:"no-stor
 async function removeRule(rule){if(!confirm("确认删除这条直连规则？\\n\\n"+rule))return;showStatus("正在删除…",true);const response=await fetch(API+"/delete",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"rule="+encodeURIComponent(rule)});const data=await response.json();if(!response.ok){showStatus(data.error||"删除失败",false);return}showStatus("已删除："+data.rule,true);offerUndo(data.rule);await refresh()}
 form.addEventListener("submit",async event=>{event.preventDefault();const value=input.value.trim();if(!value)return;showStatus("正在添加…",true);const response=await fetch(API+"/add",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"url="+encodeURIComponent(value)});const data=await response.json();if(!response.ok){showStatus(data.error||"添加失败",false);return}input.value="";hideUndo();showStatus(data.created?"已添加："+data.rule:"规则已存在："+data.rule,true);await refresh()});
 undoButton.addEventListener("click",async()=>{if(!lastDeleted)return;const rule=lastDeleted,value=addValueFor(rule);if(!value){showStatus("撤销失败，请重新添加",false);hideUndo();return}const response=await fetch(API+"/add",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:"url="+encodeURIComponent(value)});const data=await response.json();if(!response.ok){showStatus(data.error||"撤销失败",false);return}hideUndo();showStatus("已恢复："+data.rule,true);await refresh()});
+const bulkForm=document.getElementById("bulk-form"),bulkText=document.getElementById("bulk-text"),bulkStatus=document.getElementById("bulk-status"),bulkResult=document.getElementById("bulk-result");
+function showBulkStatus(text,good){if(!bulkStatus)return;bulkStatus.textContent=text;bulkStatus.className=good?"status ok":"status err"}
+function bulkLine(text){const d=document.createElement("div");d.style.cssText="font-size:13px;padding:3px 0;word-break:break-all";d.textContent=text;return d}
+if(bulkForm){bulkForm.addEventListener("submit",async event=>{event.preventDefault();const value=bulkText.value.trim();if(!value)return;showBulkStatus("正在识别…",true);if(bulkResult)bulkResult.innerHTML="";const fd=new FormData();fd.append("text",value);const response=await fetch(API+"/bulk-add",{method:"POST",body:fd});const data=await response.json().catch(()=>({}));if(!response.ok){showBulkStatus(data.error||"批量添加失败",false);return}showBulkStatus(data.message||"已处理",true);if(bulkResult){for(const a of (data.added||[]))bulkResult.appendChild(bulkLine("＋ "+(a.label?a.label+" → ":"")+a.rule));for(const e of (data.existed||[]))bulkResult.appendChild(bulkLine("＝ 已存在："+e.rule));for(const s of (data.skipped||[]))bulkResult.appendChild(bulkLine("－ 跳过 "+s.value+"（"+s.reason+"）"))}bulkText.value="";await refresh()})}
 const pwForm=document.getElementById("pw-form"),pwStatus=document.getElementById("pw-status");
 function showPwStatus(text,good){if(!pwStatus)return;pwStatus.textContent=text;pwStatus.className=good?"status ok":"status err"}
 if(pwForm){pwForm.addEventListener("submit",async event=>{event.preventDefault();showPwStatus("正在更新密码…",true);const fd=new FormData(pwForm);const response=await fetch(API+"/change-password",{method:"POST",body:fd});const data=await response.json().catch(()=>({}));if(!response.ok){showPwStatus(data.error||"修改失败",false);return}pwForm.reset();showPwStatus(data.message||"密码已更新",true)})}
